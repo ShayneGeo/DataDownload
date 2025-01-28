@@ -1,0 +1,97 @@
+# THIS WORKS DONT CHANGE Day OF Burn 
+import geopandas as gpd
+import rasterio
+import rasterio.features
+import numpy as np
+from shapely.geometry import mapping
+import utm
+import pandas as pd
+
+# Input shapefile with multi-day polygons
+shapefile_path = r"C:\Users\magst\Downloads\For_Shayne\Nasa2021_Schneider Springs_DA445C0320D0495B8523E3B7284C3F75_ExMer.shp"
+
+# Output raster
+output_raster = r"C:\Users\magst\Desktop\PerpLine_Jesse_1_15_2025\fire_progression_Nasa2021_SchneiderSprings2.tif"
+
+# Read the shapefile
+gdf = gpd.read_file(shapefile_path)
+
+# Convert the time column to datetime objects if necessary
+gdf["t"] = pd.to_datetime(gdf["t"])
+print(gdf)
+# Get unique times sorted in ascending order
+unique_times = sorted(gdf["t"].unique())
+
+# Map each unique time to its Unix time (seconds since 1970-01-01)
+time_mapping = {time: int(time.timestamp()) for time in unique_times}
+
+# Reproject to a projected coordinate system (if needed)
+lon, lat = gdf.geometry.iloc[0].centroid.coords[0]
+utm_zone = utm.from_latlon(lat, lon)[2]
+utm_crs = f"EPSG:326{utm_zone}"
+gdf = gdf.to_crs(utm_crs)
+
+# Determine raster resolution (meters per pixel)
+resolution = 30  # Adjust as needed
+
+# Calculate overall bounds
+minx, miny, maxx, maxy = gdf.total_bounds
+
+# Compute raster dimensions
+width = int((maxx - minx) / resolution)
+height = int((maxy - miny) / resolution)
+
+# Create an empty array to hold the earliest burn day
+burn_array = np.zeros((height, width), dtype=np.int32)  # Use int32 for Unix time
+
+# Transform for the raster
+transform = rasterio.transform.from_origin(minx, maxy, resolution, resolution)
+
+# Loop through each unique time in ascending order
+# For each time, rasterize polygons of that time onto the burn_array 
+# but only overwrite where burn_array is 0 (unburned)
+for time_value in unique_times:
+    # Subset polygons for this time
+    subset = gdf[gdf["t"] == time_value]
+    if subset.empty:
+        continue
+    
+    # Prepare shapes for rasterization
+    shapes = ((mapping(geom), 1) for geom in subset.geometry)
+    
+    # Rasterize subset polygons into a temporary array
+    temp_array = rasterio.features.rasterize(
+        shapes=shapes,
+        out_shape=(height, width),
+        fill=0,
+        transform=transform,
+        dtype=np.int32
+    )
+    
+    # Get the Unix time corresponding to the current time
+    time_unix = time_mapping[time_value]
+
+    # Where temp_array is 1 and burn_array is still 0, set to the current time_unix
+    burn_array = np.where(
+        (temp_array == 1) & (burn_array == 0),
+        time_unix,
+        burn_array
+    )
+
+# Write the final burn_array to a raster with Unix time for each pixel
+with rasterio.open(
+    output_raster,
+    'w',
+    driver='GTiff',
+    height=height,
+    width=width,
+    count=1,
+    dtype="int32",  # Use a valid Rasterio dtype
+    crs=utm_crs,
+    transform=transform,
+    nodata=0
+) as dst:
+    dst.write(burn_array, 1)
+
+print("Raster creation complete. Unix time recorded in each pixel.")
+# THIS WORKS DONT CHANGE
