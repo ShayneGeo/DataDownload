@@ -1,0 +1,278 @@
+import os
+import json
+import time
+import typing as T
+import requests
+import geopandas as gpd
+import pandas as pd
+from shapely.geometry import Point, LineString, MultiLineString, Polygon, MultiPolygon, shape
+from shapely.geometry.base import BaseGeometry
+import matplotlib.pyplot as plt
+
+# ---------------------------------------------------------
+# USER SETTINGS
+# ---------------------------------------------------------
+HIST_LAYER_URL = r"https://services3.arcgis.com/T4QMspbfLg3qTGWY/arcgis/rest/services/WFIGS_Interagency_Perimeters/FeatureServer/0"
+
+# Date field and year range
+DATE_FIELD = "attr_FireDiscoveryDateTime"
+YEAR = 2020
+
+# Optional: bounding box in EPSG:4326 (xmin, ymin, xmax, ymax)
+# Set BBOX = None to get all perimeters in that year
+BBOX = (-125.0, 24.0, -66.0, 50.0)  # CONUS-ish; change or set to None
+
+# Query paging
+PAGE_SIZE = 2000
+MAX_FEATURES: T.Optional[int] = None  # or e.g., 200000
+
+# Output
+OUT_DIR = r"C:\Users\Desktop\"
+OUT_NAME = "WFIGS_2020_perimeters"   # base name for outputs
+
+
+# ---------------------------------------------------------
+# HELPERS
+# ---------------------------------------------------------
+def esri_geom_to_shapely(geom: dict) -> T.Optional[BaseGeometry]:
+    if not geom:
+        return None
+    if "x" in geom and "y" in geom:
+        return Point(float(geom["x"]), float(geom["y"]))
+    if "paths" in geom and geom["paths"]:
+        paths = geom["paths"]
+        if len(paths) == 1:
+            return LineString(paths[0])
+        else:
+            return MultiLineString([LineString(p) for p in paths if len(p) >= 2])
+    if "rings" in geom and geom["rings"]:
+        try:
+            shells, holes = [], []
+            for ring in geom["rings"]:
+                if _ring_ccw(ring):
+                    shells.append(ring)
+                else:
+                    holes.append(ring)
+            if len(shells) == 1:
+                return Polygon(shells[0], holes=holes if holes else None)
+            elif len(shells) > 1:
+                return MultiPolygon([Polygon(s) for s in shells])
+            else:
+                return shape({"type": "Polygon", "coordinates": geom["rings"]})
+        except Exception:
+            try:
+                return shape({"type": "Polygon", "coordinates": geom["rings"]})
+            except Exception:
+                return None
+    if "points" in geom and geom["points"]:
+        try:
+            return shape({"type": "MultiPoint", "coordinates": geom["points"]})
+        except Exception:
+            return None
+    return None
+
+
+def _ring_ccw(coords: T.List[T.List[float]]) -> bool:
+    area = 0.0
+    for i in range(len(coords) - 1):
+        x1, y1 = coords[i]
+        x2, y2 = coords[i + 1]
+        area += (x2 - x1) * (y2 + y1)
+    return area < 0.0
+
+
+def arcgis_query_esrijson(
+    layer_url: str,
+    where: str,
+    page_size: int = 2000,
+    max_features: T.Optional[int] = None,
+    bbox: T.Optional[T.Tuple[float, float, float, float]] = None,
+) -> T.List[dict]:
+    features = []
+    offset = 0
+
+    geom_params = {}
+    if bbox is not None:
+        xmin, ymin, xmax, ymax = bbox
+        geom_params = {
+            "geometry": json.dumps(
+                {
+                    "xmin": xmin,
+                    "ymin": ymin,
+                    "xmax": xmax,
+                    "ymax": ymax,
+                    "spatialReference": {"wkid": 4326},
+                }
+            ),
+            "geometryType": "esriGeometryEnvelope",
+            "spatialRel": "esriSpatialRelIntersects",
+            "inSR": 4326,
+        }
+
+    while True:
+        params = {
+            "where": where,
+            "outFields": "*",
+            "returnGeometry": "true",
+            "f": "json",
+            "resultOffset": offset,
+            "resultRecordCount": page_size,
+            "outSR": 4326,
+        }
+        params.update(geom_params)
+
+        qurl = layer_url.rstrip("/") + "/query"
+        resp = requests.get(qurl, params=params, timeout=180)
+        resp.raise_for_status()
+        chunk = resp.json()
+
+        if "error" in chunk:
+            raise RuntimeError(f"ArcGIS query error: {chunk['error']}")
+
+        chunk_features = chunk.get("features", [])
+        if not chunk_features:
+            break
+
+        features.extend(chunk_features)
+        offset += page_size
+
+        if max_features is not None and len(features) >= max_features:
+            features = features[:max_features]
+            break
+
+        if len(chunk_features) < page_size:
+            break
+
+        time.sleep(0.1)
+
+    return features
+
+
+def esrijson_to_gdf(features: T.List[dict]) -> gpd.GeoDataFrame:
+    recs = []
+    for ftr in features:
+        attrs = ftr.get("attributes", {}) or {}
+        geom = ftr.get("geometry")
+        shp = esri_geom_to_shapely(geom)
+        if shp is None:
+            continue
+        rec = dict(attrs)
+        rec["geometry"] = shp
+        recs.append(rec)
+
+    if not recs:
+        return gpd.GeoDataFrame(pd.DataFrame(), geometry=[], crs="EPSG:4326")
+
+    gdf = gpd.GeoDataFrame(recs, geometry="geometry", crs="EPSG:4326")
+    return gdf
+
+
+def sanitize_for_shapefile(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """
+    Make a GeoDataFrame safe-ish for Shapefile:
+      * convert ArcGIS epoch-ms date fields to strings
+      * truncate field names to <=10 chars
+      * cast object cols to str, bool to int8
+    """
+    df = gdf.copy()
+    if df.empty:
+        return df
+
+    # 1) convert obvious date fields (epoch ms) to readable strings
+    date_like_cols = [
+        c for c in df.columns
+        if c != "geometry"
+        and ("Date" in c or "DateTime" in c or c.endswith("_dt"))
+    ]
+    for c in date_like_cols:
+        if pd.api.types.is_integer_dtype(df[c]) or pd.api.types.is_float_dtype(df[c]):
+            # ArcGIS dates are ms since 1970
+            df[c] = pd.to_datetime(df[c], unit="ms", errors="coerce")
+        # format as string for Shapefile
+        if pd.api.types.is_datetime64_any_dtype(df[c]):
+            df[c] = df[c].dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    # 2) truncate field names
+    orig_cols = [c for c in df.columns if c != "geometry"]
+    new_cols, used = [], set()
+
+    for c in orig_cols:
+        base = (str(c)[:10]) if len(str(c)) > 10 else str(c)
+        name = base
+        i = 1
+        while name.lower() in used:
+            suffix = str(i)
+            name = (base[: (10 - len(suffix))] + suffix)[:10]
+            i += 1
+        used.add(name.lower())
+        new_cols.append(name)
+
+    rename_map = {old: new for old, new in zip(orig_cols, new_cols)}
+    df = df.rename(columns=rename_map)
+
+    # 3) basic type casting for Shapefile
+    for c in [c for c in df.columns if c != "geometry"]:
+        if pd.api.types.is_bool_dtype(df[c]):
+            df[c] = df[c].astype("int8")
+        elif pd.api.types.is_object_dtype(df[c]):
+            df[c] = df[c].astype(str)
+
+    return df
+
+
+# ---------------------------------------------------------
+# MAIN
+# ---------------------------------------------------------
+def main():
+    os.makedirs(OUT_DIR, exist_ok=True)
+
+    start = f"{YEAR}-01-01 00:00:00"
+    end   = f"{YEAR+1}-01-01 00:00:00"
+    where = (
+        f"{DATE_FIELD} >= DATE '{start}' AND "
+        f"{DATE_FIELD} < DATE '{end}'"
+    )
+
+    print(f"[Info] Query WHERE: {where}")
+    if BBOX is not None:
+        print(f"[Info] Using BBOX: {BBOX}")
+    else:
+        print("[Info] No BBOX filter (national year filter only).")
+
+    feats = arcgis_query_esrijson(
+        HIST_LAYER_URL,
+        where=where,
+        page_size=PAGE_SIZE,
+        max_features=MAX_FEATURES,
+        bbox=BBOX,
+    )
+    print(f"[Info] Retrieved {len(feats)} features.")
+
+    gdf = esrijson_to_gdf(feats)
+    if gdf.empty:
+        print("[Info] No features after geometry conversion.")
+        return
+
+    shp_path = os.path.join(OUT_DIR, OUT_NAME + ".shp")
+    gpkg_path = os.path.join(OUT_DIR, OUT_NAME + ".gpkg")
+
+    print(f"[Info] Writing Shapefile to: {shp_path}")
+    sanitize_for_shapefile(gdf).to_file(shp_path, driver="ESRI Shapefile", encoding="utf-8")
+
+    print(f"[Info] Writing GeoPackage to: {gpkg_path}")
+    # For full fidelity use GeoPackage instead of shapefile:
+    # gdf.to_file(gpkg_path, driver="GPKG", layer=OUT_NAME)
+
+    # Quick extent plot
+    ax = gdf.boundary.plot(figsize=(8, 6))
+    ax.set_title(f"WFIGS Interagency Perimeters – {YEAR}")
+    ax.set_xlabel("Longitude")
+    ax.set_ylabel("Latitude")
+    plt.tight_layout()
+    plt.show()
+
+    print("[Done]")
+
+
+if __name__ == "__main__":
+    main()
